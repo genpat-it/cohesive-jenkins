@@ -1,0 +1,119 @@
+// def paramsList = []
+// paramsList <<  string(defaultValue: '', description: '', name: 'WATCHED_DIR', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'JENKINS_BUILD_RESULT', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'JENKINS_BUILD_URL', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'NXF_SCRIPT', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'NXF_ENTRYPOINT', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'NXF_TRACEDIR', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'NXF_OUTDIR', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'TEMPLATE_DEFINITION', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'WEBHOOK_EXECUTION', trim: true)
+// properties([parameters(paramsList)])
+
+CONFIG = getConfiguration()
+def CONTROLLER_NODE= params.CONTROLLER_NODE ?: CONFIG.CONTROLLER_NODE
+def WEBHOOK_EXECUTION = params.WEBHOOK_EXECUTION ?: CONFIG.WEBHOOK_EXECUTION
+def NOTIFICATION_TARGET = params.NOTIFICATION_TARGET ?: CONFIG.NOTIFICATION_TARGET
+
+node(CONTROLLER_NODE) {
+    try {
+        checkParams()
+
+        def buildResult = params.JENKINS_BUILD_RESULT.toLowerCase()
+
+        def result = [:]
+
+        // jenkins result
+        def resultJenkins = [:]
+        resultJenkins.buildResult=buildResult
+        resultJenkins.buildUrl=params.JENKINS_BUILD_URL
+        result.jenkins = resultJenkins
+        
+        if (params.NXF_OUTDIR) {
+            //nextflow result
+            def resultNextflow = [:]
+            resultNextflow.script=params.NXF_SCRIPT
+            resultNextflow.entrypoint=params.NXF_ENTRYPOINT
+            resultNextflow.outputDir=params.NXF_OUTDIR
+            resultNextflow.traceDir=params.NXF_TRACEDIR
+            result.nexflow = resultNextflow
+        }
+        
+        dir(params.WATCHED_DIR) {
+            def definition = readJSON(file: TEMPLATE_DEFINITION)
+            definition.result=result
+            writeJSON(json: definition, file: TEMPLATE_DEFINITION)
+            def resultUpdateRequest = [:]
+            resultUpdateRequest.status = 'completed'
+            resultUpdateRequest.template = definition.template // for retrocompatibility
+            resultUpdateRequest.definition = definition
+
+            switch (params.JENKINS_BUILD_RESULT) {
+                case 'FAILURE':
+                    resultUpdateRequest.result = 'failure'
+                    break
+                case 'UNSTABLE':
+                    resultUpdateRequest.result = 'warning'
+                    break
+                case 'ABORTED':
+                    resultUpdateRequest.result = 'aborted'
+                    break                    
+                case 'NOT_BUILT':
+                    resultUpdateRequest.result = 'not_built'
+                    break                    
+                case 'UNKNOWN':
+                    resultUpdateRequest.result = 'unknown'
+                    break                    
+                default:
+                    resultUpdateRequest.result = 'success'
+            }
+
+            if (definition.uuid) {
+                if (WEBHOOK_EXECUTION) {
+                    def body, url
+                    try {
+                        body = writeJSON returnText: true, json: resultUpdateRequest
+                        url = WEBHOOK_EXECUTION.replaceAll(':timestamp', definition.timestamp).replaceAll(':uuid', definition.uuid)
+                        withCredentials([string(credentialsId: 'BITW2_SERVICE_TOKEN', variable: 'API_TOKEN')]) {
+                            httpRequest(url: url, contentType: 'APPLICATION_JSON', requestBody: body, httpMode: 'POST', consoleLogResponseBody : true, customHeaders: [[name: 'CMDBuild-Authorization', value: API_TOKEN, maskValue: true]])
+                        }
+                    } catch (err) {
+                        notifyService("warning","Webhook error. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+                        echo "url: ${url}, body: ${body}"
+                        error("$err")
+                    }
+                }                
+            }  
+        }      
+    } catch (err) {
+        currentBuild.result = 'FAILURE'    
+        def message = "Could not write build result in ${WATCHED_DIR}, error: ${err}, template definition: ${TEMPLATE_DEFINITION}"
+        echo message
+        notifyService("danger","${message}. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")       
+    }
+}
+
+def checkParams() {
+    ['WATCHED_DIR','JENKINS_BUILD_RESULT','JENKINS_BUILD_URL','TEMPLATE_DEFINITION','CONTROLLER_NODE', 'WEBHOOK_EXECUTION'].each {
+        if (!params[it] && !CONFIG[it] && !env."$it") {
+            error("params: '${it}' is required")
+        }
+    }
+}
+
+def notifyService(color, message) {
+    // [TODO-notifyService]
+}
+
+def getConfiguration() {
+    try {
+        node {
+            configFileProvider(
+                [configFile(fileId: 'jenkins_jobs', variable: "JOB_CONFIG")]) {
+                    return readJSON(file: JOB_CONFIG, returnPojo: true)
+            }
+        }
+    } catch (err) {
+        error("could not load settings")
+    }    
+}

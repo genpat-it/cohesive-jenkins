@@ -1,0 +1,101 @@
+// def paramsList = []
+// paramsList <<  string(defaultValue: '', description: '', name: 'WORKER_NODE', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'DB_ADDRESS', trim: true)
+// paramsList <<  string(defaultValue: 'upload', description: '', name: 'TYPE', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'TEMPLATE_DEFINITION', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'OUTPUT_FOLDER', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'WATCHED_DIR', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'TOOL_PARAMS', trim: true)
+// properties([parameters(paramsList)])
+// return
+
+CONFIG = getConfiguration()
+def TOOL_PARAMS = params.TOOL_PARAMS ?: ''
+def TOOLS_FOLDER = params.TOOLS_FOLDER ?: CONFIG.TOOLS_FOLDER
+def TOOL_FILENAME = params.TOOL_FILENAME ?: 'bit2.jar'
+def STATUS_UPDATE_JOB = params.STATUS_UPDATE_JOB ?: CONFIG.STATUS_UPDATE_JOB
+def WORKER_NODE = params.WORKER_NODE ?:  CONFIG.WORKER_NODE
+def DB_ADDRESS = params.DB_ADDRESS ?: CONFIG.DB_ADDRESS
+def SAMPLES_FOLDER = params.SAMPLES_FOLDER ?: CONFIG.SAMPLES_FOLDER
+def NOTIFICATION_TARGET = params.NOTIFICATION_TARGET ?: CONFIG.NOTIFICATION_TARGET
+
+def pipelineDetails = [:]
+
+   
+node(WORKER_NODE) {        
+    try {
+        checkParams()
+
+        pipelineDetails = readJSON file: "${WATCHED_DIR}/${params.TEMPLATE_DEFINITION}"
+        currentBuild.displayName = "[#${env.BUILD_NUMBER}] ${pipelineDetails.template}"
+        currentBuild.description = "${params.TEMPLATE_DEFINITION -~ /^.*\//}\n${params.OUTPUT_FOLDER}"
+        
+        try {
+            stage("Import") {         
+                withCredentials([usernamePassword(credentialsId: 'COHESIVE_POSTGRES', passwordVariable: 'DBPASSWORD', usernameVariable: 'DBUSERNAME')]) {
+                    sh """
+                        echo \$\$ >> jenkins.pid
+                        java -jar ${TOOLS_FOLDER}/${TOOL_FILENAME} --db.address=${DB_ADDRESS} --db.username=${DBUSERNAME} --db.password=${DBPASSWORD} --app.sample-folder=${SAMPLES_FOLDER} --type=${TYPE} --workingPath=${params.OUTPUT_FOLDER} ${TOOL_PARAMS} 
+                    """
+                }            
+            }        
+        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException fie) {
+            echo "Execution interrupted"
+            currentBuild.result = 'ABORTED'    
+            notifyService("#888888","Execution interrupted. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+        } catch (err) {
+            echo "Failed: ${err}"                    
+            currentBuild.result = 'FAILURE'    
+        }
+   
+        notifyServiceAboutBuildStatus(pipelineDetails.template)
+    } catch (err) {
+        echo "Failed: ${err}"
+        currentBuild.result = 'FAILURE'    
+        notifyService("danger","Build finished with result: ${currentBuild.result}. [${pipelineDetails.template}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    }
+}
+def jobParams = []
+jobParams << string(name: 'WATCHED_DIR', value: params.WATCHED_DIR)                        
+jobParams << string(name: 'JENKINS_BUILD_RESULT', value: currentBuild.result ?: 'SUCCESS')
+jobParams << string(name: 'JENKINS_BUILD_URL', value: env.BUILD_URL)
+jobParams << string(name: 'TEMPLATE_DEFINITION', value: params.TEMPLATE_DEFINITION)                        
+
+build wait: false, job: STATUS_UPDATE_JOB, parameters: jobParams
+
+def notifyServiceAboutBuildStatus(entrypoint) {
+    if (currentBuild.result == 'FAILURE') {
+        notifyService("danger","Build finished with result: ${currentBuild.result}. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    } else if (currentBuild.result == 'UNSTABLE') {
+        notifyService("warning","Build finished with result: ${currentBuild.result}. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    } else if (currentBuild.result in ['NOT_BUILT','ABORTED']) {
+        notifyService("#888888","Build finished with result: ${currentBuild.result}. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    } else  {
+        notifyService("good","Build finished. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    }  
+}
+
+def notifyService(color, message) {
+    // [TODO-notifyService]
+}
+
+def checkParams() {
+    ['TEMPLATE_DEFINITION','WORKER_NODE','WATCHED_DIR', 'OUTPUT_FOLDER', 'DB_ADDRESS', 'SAMPLES_FOLDER', 'TOOLS_FOLDER', 'TYPE'].each {
+        if (!params[it] && !CONFIG[it] && !env."$it") {
+            error("params: '${it}' is required")
+        }
+    }
+}
+
+def getConfiguration() {
+    try {
+        node {
+            configFileProvider(
+                [configFile(fileId: 'jenkins_jobs', variable: "JOB_CONFIG")]) {
+                    return readJSON(file: JOB_CONFIG, returnPojo: true)
+            }
+        }
+    } catch (err) {
+        error("could not load settings")
+    }    
+}

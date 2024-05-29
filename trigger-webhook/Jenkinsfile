@@ -1,0 +1,61 @@
+CONFIG = getConfiguration()
+def CONTROLLER_NODE= params.CONTROLLER_NODE ?: CONFIG.CONTROLLER_NODE
+def WEBHOOK_BASE_URL= params.WEBHOOK_BASE_URL ?: CONFIG.WEBHOOK_BASE_URL
+def NOTIFICATION_TARGET = params.NOTIFICATION_TARGET ?: CONFIG.NOTIFICATION_TARGET
+
+def ENDPOINT_PATH = params.ENDPOINT_PATH ?: ''
+def PAYLOAD = params.WEBHOOK_BASE_URL ?: [:]
+def WEBHOOK = "${WEBHOOK_BASE_URL}${ENDPOINT_PATH}"
+
+try {
+
+    checkParams()
+
+    node(CONTROLLER_NODE) {
+        def body = writeJSON returnText: true, json: PAYLOAD
+                    withCredentials([string(credentialsId: 'BITW2_SERVICE_TOKEN', variable: 'API_TOKEN')]) {
+            def response = httpRequest(url: WEBHOOK, contentType: 'APPLICATION_JSON', httpMode: 'POST', requestBody: body, consoleLogResponseBody : false, customHeaders: [[name: 'CMDBuild-Authorization', value: API_TOKEN, maskValue: true]])
+            
+            if (!response.content) {
+                // 204 case
+                return
+            }
+            def result = readJSON text: response.content, returnPojo: true
+            if (result?.messages) {
+                notifyService('warning', result.messages.collect{"${it.level}: ${it.message}"}.join("\n"))
+                println(writeJSON(json: result, pretty: 2, returnText: true))
+            }
+        }
+        notifyService("good","Build finished. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    }
+} catch (err) {
+    echo "Failed: ${err}"
+    notifyService('danger', "Could not trigger webhook: ${WEBHOOK}. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    currentBuild.result = 'FAILURE'   
+    return; 
+}
+
+def notifyService(color, message) {
+    // [TODO-notifyService]
+}
+
+def checkParams() {
+    ['CONTROLLER_NODE', 'ENDPOINT_PATH', 'WEBHOOK_BASE_URL'].each {
+        if (!params[it] && !CONFIG[it] && !env."$it") {
+            error("params: '${it}' is required")
+        }
+    }
+}
+
+def getConfiguration() {
+    try {
+        node {
+            configFileProvider(
+                [configFile(fileId: 'jenkins_jobs', variable: "JOB_CONFIG")]) {
+                    return readJSON(file: JOB_CONFIG, returnPojo: true)
+            }
+        }
+    } catch (err) {
+        error("could not load settings")
+    }    
+}

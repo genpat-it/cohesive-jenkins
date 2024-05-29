@@ -1,0 +1,176 @@
+// def paramsList = []
+// paramsList <<  string(defaultValue: '', description: '', name: 'OUTPUT_FOLDER', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'NODE_LABEL', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'DB_ADDRESS', trim: true)
+// paramsList <<  string(defaultValue: '/data/samples', description: '', name: 'SAMPLES_FOLDER', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'TEMPLATE_DEFINITION', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'WATCHED_DIR', trim: true)
+// paramsList <<  string(defaultValue: '/data/tools', description: '', name: 'TOOLS_FOLDER', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'WEBLOG_ENDPOINT', trim: true)
+// properties([parameters(paramsList)])
+// return
+
+CONFIG = getConfiguration()
+def PARAMS_FILE = "${params.OUTPUT_FOLDER}/params.json"
+def META_FOLDER= "${params.OUTPUT_FOLDER}_${UUID.randomUUID().toString()}"
+def NXF_SCRIPT = params.NXF_SCRIPT ?: '/etc/ncbi_download.nf'
+def NGSMANAGER_PROJECT = params.NGSMANAGER_PROJECT ?: CONFIG.NGSMANAGER_PROJECT
+def COMMIT_ID = params.NGSMANAGER_REF ?: CONFIG.NGSMANAGER_REF ?: "master"
+def NXF_PARAMS = params.NXF_PARAMS ?: ''
+def STATUS_UPDATE_JOB = params.STATUS_UPDATE_JOB ?: CONFIG.STATUS_UPDATE_JOB
+def TOOLS_FOLDER = params.TOOLS_FOLDER ?: CONFIG.TOOLS_FOLDER
+def TOOL_FILENAME = params.TOOL_FILENAME ?: 'bit2.jar'
+def TOOL_PARAMS = params.TOOL_PARAMS ?: ''
+def SAMPLES_FOLDER = params.SAMPLES_FOLDER ?: CONFIG.SAMPLES_FOLDER
+def DB_ADDRESS = params.DB_ADDRESS ?: CONFIG.DB_ADDRESS
+def TYPE = 'reference'
+def WORKER_NODE = params.WORKER_NODE ?:  CONFIG.WORKER_NODE
+def NOTIFICATION_TARGET = params.NOTIFICATION_TARGET ?: CONFIG.NOTIFICATION_TARGET
+def WEBLOG_ENDPOINT =  params.WEBLOG_ENDPOINT ?: CONFIG.WEBLOG_ENDPOINT ?: ''
+
+def pipelineDetails = [:]
+    
+try {
+    checkParams()
+
+    node(WORKER_NODE) {        
+        try {          
+            pipelineDetails = readJSON file: "${WATCHED_DIR}/${params.TEMPLATE_DEFINITION}"
+            currentBuild.description = "${params.TEMPLATE_DEFINITION -~ /^.*\//}\n${params.OUTPUT_FOLDER}"
+            
+            def analysis_date = extractAnalysisDate(pipelineDetails.timestamp)
+
+            stage("Download from NCBI") {
+                dir (META_FOLDER) {                    
+                    echo "Cloning nextflow project"
+                    checkout poll: false, scm: [$class: 'GitSCM', branches: [[name: "${COMMIT_ID}"]], extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'ngsmanager']], userRemoteConfigs: [[credentialsId: 'git_repo',url: "${NGSMANAGER_PROJECT}"]]]                        
+                }     
+                ws (params.OUTPUT_FOLDER) {      
+                    def paramsFileExists = fileExists PARAMS_FILE
+                    if (!paramsFileExists) {
+                        error("No params file exists")
+                    }
+                    def nxfParams = readJSON file: PARAMS_FILE
+                    currentBuild.displayName = "[#${env.BUILD_NUMBER}] ${nxfParams.reference}"
+
+                    // calculate Memory and CPU options for current node
+                    def executors = getNumOfExecutors(NODE_NAME)
+                    def nodeMemory = sh(script: "free --mega | grep Mem | awk '{ print \$2 }'", returnStdout: true) as int
+                    def cpus = sh(script: "lscpu | grep '^CPU(s):' | awk '{ print \$2 }'", returnStdout: true) as int
+                    def NXF_EXTRA=" --max_memory '${nodeMemory.intdiv(executors)}.MB' --max_cpus '${cpus}'"
+                    echo "This node '${NODE_NAME}' has ${nodeMemory}.MB of RAM, ${cpus} cpus, ${executors} executors."
+                    echo "NXF_EXTRA: ${NXF_EXTRA}"
+
+                    // settings defined in jenkins
+                    writeFile file: 'jenkins.config', text: getNgsmanagerConfiguration()         
+                    sh(script: "nextflow -q -log ./pipeline_info/nxf.log run -params-file params.json -c jenkins.config --tracedir ./pipeline_info  ${META_FOLDER}/ngsmanager/${NXF_SCRIPT} ${NXF_PARAMS} --monochrome_logs -with-weblog ${WEBLOG_ENDPOINT} --analysis_date '${analysis_date}' ${NXF_EXTRA}", label: "Downloading NCBI reference: on node ${NODE_NAME}")
+                }                  
+            }
+            stage("Import") {                       
+                withCredentials([usernamePassword(credentialsId: 'COHESIVE_POSTGRES', passwordVariable: 'DBPASSWORD', usernameVariable: 'DBUSERNAME')]) {
+                    sh """
+                        echo \$\$ >> jenkins.pid
+                        java -jar ${TOOLS_FOLDER}/${TOOL_FILENAME} --db.address=${DB_ADDRESS} --db.username=${DBUSERNAME} --db.password=${DBPASSWORD} --app.sample-folder=${SAMPLES_FOLDER} --type=${TYPE} --workingPath=${params.OUTPUT_FOLDER} ${TOOL_PARAMS} 
+                    """
+                }                  
+            }              
+        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException fie) {
+            echo "Execution interrupted"
+            currentBuild.result = 'ABORTED'    
+            notifyService("#888888","Execution interrupted. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+        } catch (err) {
+            echo "Failed: ${err}"                    
+            currentBuild.result = 'FAILURE'    
+        } finally { 
+            try {
+                lock("${env.JOB_NAME}_cleanup") {
+                    if (!"${META_FOLDER}".trim()) { error "empty after trimming: 'UPLOADS_PATH'" }
+                    sh """
+                        set -euo pipefail
+                        rm -Rf ${META_FOLDER}/ngsmanager*
+                        find ${META_FOLDER} -maxdepth 0 -type d -empty -delete      
+                    """                                               
+                }
+            } catch (err) {
+                echo "META folder cleanup error error: ${err}"
+                notifyService("warning","Could not cleanup META folder. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+            }
+        }       
+    }
+    notifyServiceAboutBuildStatus(pipelineDetails.template)
+} catch (err) {
+    echo "Failed: ${err}"
+    currentBuild.result = 'FAILURE'    
+    notifyService("danger","Build finished with result: ${currentBuild.result}. [${pipelineDetails.template}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+}
+
+def jobParams = []
+jobParams << string(name: 'WATCHED_DIR', value: params.WATCHED_DIR)                        
+jobParams << string(name: 'JENKINS_BUILD_RESULT', value: currentBuild.result ?: 'SUCCESS')
+jobParams << string(name: 'JENKINS_BUILD_URL', value: env.BUILD_URL)
+jobParams << string(name: 'TEMPLATE_DEFINITION', value: params.TEMPLATE_DEFINITION)                        
+
+build wait: false, job: STATUS_UPDATE_JOB, parameters: jobParams
+
+def notifyServiceAboutBuildStatus(entrypoint) {
+    if (currentBuild.result == 'FAILURE') {
+        notifyService("danger","Build finished with result: ${currentBuild.result}. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    } else if (currentBuild.result == 'UNSTABLE') {
+        notifyService("warning","Build finished with result: ${currentBuild.result}. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    } else if (currentBuild.result in ['NOT_BUILT','ABORTED']) {
+        notifyService("#888888","Build finished with result: ${currentBuild.result}. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    } else  {
+        notifyService("good","Build finished. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    }  
+}
+
+def notifyService(color, message) {
+    // [TODO-notifyService]
+}
+
+def checkParams() {
+    ['TEMPLATE_DEFINITION','WORKER_NODE','WATCHED_DIR', 'OUTPUT_FOLDER', 'DB_ADDRESS', 'SAMPLES_FOLDER','TOOLS_FOLDER', 'NGSMANAGER_PROJECT'].each {
+        if (!params[it] && !CONFIG[it] && !env."$it") {
+            error("params: '${it}' is required")
+        }
+    }
+}
+
+def extractAnalysisDate(outputFolder) {
+    def matcher = outputFolder =~ /^\d{2}(\d{6})_(\d+)$/      
+    if (!matcher.matches()) {
+        error("invalid timestamp provided: ${outputFolder}")
+    }
+    return "${matcher.group(1)}${matcher.group(2)}".padRight(15,'0')
+}
+
+def getConfiguration() {
+    try {
+        node {
+            configFileProvider(
+                [configFile(fileId: 'jenkins_jobs', variable: "JOB_CONFIG")]) {
+                   return readJSON(file: JOB_CONFIG, returnPojo: true)
+            }
+        }
+    } catch (err) {
+        error("could not load settings")
+    }    
+}
+
+def getNgsmanagerConfiguration() {
+    try {
+        node {
+            configFileProvider(
+                [configFile(fileId: 'ngsmanager', variable: "NGSMANAGER_CONFIG")]) {
+                    return readFile("${NGSMANAGER_CONFIG}")
+            }
+        }
+    } catch (err) {
+        error("could not load ngsmanager settings")
+    }
+}
+
+@NonCPS
+def getNumOfExecutors(nodeName) {
+    return Jenkins.instance.getNode(nodeName).numExecutors
+}

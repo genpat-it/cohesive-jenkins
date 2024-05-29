@@ -1,0 +1,509 @@
+import org.apache.commons.csv.CSVFormat
+
+// def paramsList = []
+// paramsList <<  string(defaultValue: '', description: '', name: 'OUTPUT_FOLDER', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'STEP', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'MODULE', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'METHOD', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'WEBLOG_ENDPOINT', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'SCRATCH_FOLDER', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'NGSMANAGER_PROFILES', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'WATCHED_DIR', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'TEMPLATE_DEFINITION', trim: true)
+// paramsList <<  text(defaultValue: '', description: '', name: 'NXF_PARAMS', trim: true)
+// paramsList <<  string(defaultValue: '', description: '', name: 'PRIORITY', trim: true)
+// properties([parameters(paramsList)])
+// return
+
+CONFIG = getConfiguration()
+def NXF_SCRIPT = ""
+def NGSMANAGER_PROJECT = params.NGSMANAGER_PROJECT ?: CONFIG.NGSMANAGER_PROJECT
+def COMMIT_ID = params.NGSMANAGER_REF ?: CONFIG.NGSMANAGER_REF ?: "master"
+def COMMIT_DATE = ""
+def CONTROLLER_NODE = params.CONTROLLER_NODE ?:  CONFIG.CONTROLLER_NODE
+def WORKER_NODE = params.WORKER_NODE ?:  CONFIG.WORKER_NODE
+def SCRATCH_FOLDER= params.SCRATCH_FOLDER ?: CONFIG.SCRATCH_FOLDER ?: ''
+def SCRATCH_FOLDER_PROFILE = params.SCRATCH_FOLDER_PROFILE ?: 'scratch'
+def PROFILES = params.NGSMANAGER_PROFILES ? params.NGSMANAGER_PROFILES.split(',').collect { it.trim() } : []
+def NGSMANAGER_PARAMS = params.NGSMANAGER_PARAMS ?: CONFIG.NGSMANAGER_PARAMS ?: ''
+def NXF_META_FOLDER= params.NXF_META_FOLDER ?: "${params.OUTPUT_FOLDER}_${UUID.randomUUID().toString()}"
+def PARALLEL_PROCESSING_LIMIT = (params.PARALLEL_PROCESSING_LIMIT as int) ?: 10
+def STATUS_UPDATE_JOB = params.STATUS_UPDATE_JOB ?: CONFIG.STATUS_UPDATE_JOB
+def NOTIFICATION_TARGET = params.NOTIFICATION_TARGET ?: CONFIG.NOTIFICATION_TARGET
+def WEBLOG_ENDPOINT =  params.WEBLOG_ENDPOINT ?: CONFIG.WEBLOG_ENDPOINT ?: ''
+
+def analysis_date = ""
+def totalOfFailedProcesses = 0
+def samplesWithErrors = []
+def totalOfFailedBatches = 0
+
+def builders = [:]
+
+try {
+    if (SCRATCH_FOLDER) {
+        PROFILES << SCRATCH_FOLDER_PROFILE
+    }
+    NXF_PROFILES = PROFILES ? " -profile ${PROFILES.join(',')} " : ''
+
+   
+    checkParams()
+
+    // notifyService("#439FE0","Build Started. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}paramsList|Open>)")
+
+    NXF_SCRIPT = getScript()
+    NXF_ENTRYPOINT = NXF_SCRIPT - ~/.+\//
+
+    def INPUT_FILE = "${params.OUTPUT_FOLDER}/results.csv"
+    def INPUT_FILE_JSON = "${params.OUTPUT_FOLDER}/input.json"
+    def PARAMS_FILE = "${params.OUTPUT_FOLDER}/params.json"
+
+    def NXF_PARAMS_FILE_OPTION = ""
+   
+    def samplesParams = []
+    
+    def PIPELINE_TIMESTAMP
+    
+    def NXF_CONFIG = '{}'
+
+    stage("Preprocessing") {
+            currentBuild.displayName = "[#${env.BUILD_NUMBER}] ${NXF_ENTRYPOINT}"
+            currentBuild.description = "${params.TEMPLATE_DEFINITION -~ /^.*\//}\n${params.OUTPUT_FOLDER}"
+
+        node(CONTROLLER_NODE) {
+            try {
+                try {
+                    configFileProvider(
+                        [configFile(fileId: 'ngsmanager', variable: "NGSMANAGER_CONFIG")]) {
+                        NXF_CONFIG = readFile("${NGSMANAGER_CONFIG}")
+                    }
+                } catch (err) {
+                    println "WARN: could not load ngsmanager settings"
+                }
+                def pipelineDetails = readJSON file: "${WATCHED_DIR}/${params.TEMPLATE_DEFINITION}"
+                analysis_date = extractAnalysisDate(pipelineDetails.timestamp)
+
+                PIPELINE_TIMESTAMP = pipelineDetails.timestamp
+
+                def paramsFileExists = fileExists PARAMS_FILE
+                def inputFileExists = fileExists INPUT_FILE
+                def inputFileJsonExists = fileExists INPUT_FILE_JSON
+
+                if (!inputFileExists && !paramsFileExists && !inputFileJsonExists) {
+                    error("No input file exists")
+                }
+
+                if (paramsFileExists) {
+                    def fileContent = readFile PARAMS_FILE
+                    if (fileContent.trim()) {
+                        NXF_PARAMS_FILE_OPTION = " -params-file ${PARAMS_FILE} "
+                    }
+                }
+                if (inputFileJsonExists) {
+                    // single sample analysis
+                    def samples = readJSON(file: INPUT_FILE_JSON)
+                    if (samples.isEmpty()) {
+                        error("Input file is empty")
+                    }  
+                    samplesParams = createRunParamsFromJson(samples)                
+                } else if (inputFileExists) {
+                    // single sample analysis
+                    def samples = readCSV(file: INPUT_FILE, format: CSVFormat.DEFAULT.withDelimiter(';' as char).withIgnoreSurroundingSpaces(true).withFirstRecordAsHeader())
+                    if (samples.isEmpty()) {
+                        error("Input file is empty")
+                    }  
+                    samplesParams = createRunParams(samples)                    
+                } else {
+                    // multi sample analysis
+                    // just one single execution with no CMP/RISCD input
+                    samplesParams << '' 
+                    def samples = readJSON(file: PARAMS_FILE)
+                    if (samples.isEmpty() || !samples.input) {
+                        error("Input is empty")
+                    }                    
+                }      
+                ws(NXF_META_FOLDER) {}
+                ws(params.OUTPUT_FOLDER) {}
+        } catch (err) {
+            echo "Failed: ${err}"
+                writeFile file: "${params.OUTPUT_FOLDER}/errors.log", text: "Could not read or parse input file\n"
+            error("could not read or parse input file")
+        }
+    }     
+    }
+
+    def META_FOLDER= SCRATCH_FOLDER ? "${SCRATCH_FOLDER}${NXF_META_FOLDER}" : NXF_META_FOLDER
+
+    for (int i = 0; i < samplesParams.size(); i+=1) {
+        def index = i
+        def currentParams = samplesParams[i]
+        def currentPrefix = currentParams ? extractSample(currentParams) : index     
+        builders["${index}"] = {
+            node(WORKER_NODE) {
+                // calculate Memory and CPU options for current node
+                def executors = getNumOfExecutors(NODE_NAME)
+                def nodeMemory = sh(script: "free --mega | grep Mem | awk '{ print \$2 }'", returnStdout: true) as int
+                def cpus = sh(script: "lscpu | grep '^CPU(s):' | awk '{ print \$2 }'", returnStdout: true) as int
+                def NXF_EXTRA=" --max_memory '${nodeMemory.intdiv(executors)}.MB' --max_cpus '${cpus}'"
+                echo "This node '${NODE_NAME}' has ${nodeMemory}.MB of RAM, ${cpus} cpus, ${executors} executors."
+                echo "NXF_EXTRA: ${NXF_EXTRA}"
+
+
+                def PROCESS_OUTPUT_FOLDER= SCRATCH_FOLDER ? "${SCRATCH_FOLDER}/${params.OUTPUT_FOLDER}/${index}" : params.OUTPUT_FOLDER
+                def META_WORK_FOLDER= SCRATCH_FOLDER ? "${META_FOLDER}/${index}" : META_FOLDER
+
+                 // stage("${stageNum}") {
+                    // build steps that should happen on all nodes go here
+                try {
+                    lock('git_checkout') {
+                        def previouslyCloned = fileExists file: "${META_FOLDER}/ngsmanager/main.nf"
+                            if (!previouslyCloned) {
+                            dir ("${META_FOLDER}") {                    
+                                echo "Cloning nextflow project"
+                                scmVars = checkout poll: false, scm: [$class: 'GitSCM', branches: [[name: "${COMMIT_ID}"]], extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'ngsmanager']], userRemoteConfigs: [[credentialsId: 'git_repo',url: "${NGSMANAGER_PROJECT}"]]]                        
+                                COMMIT_ID = scmVars.GIT_COMMIT
+                                COMMIT_DATE = sh(script: "git -C ngsmanager log --pretty=tformat:'%cI' -1", returnStdout: true).trim();
+                            }
+                        }
+                    }
+                    
+                    dir ("${META_WORK_FOLDER}/work/${index}") {   
+
+                        if (SCRATCH_FOLDER) {
+                            // link nextflow workflows aka ngsmanager. not copied, just linked - hopefully it's loaded into memory at startup time
+                            sh "ln -s ${META_FOLDER}/ngsmanager ${META_WORK_FOLDER}/"
+                        }
+                        
+                        // create file with metadata
+                        writeFile file: 'meta.config', text: """
+                            env {
+                                _meta_='node=${NODE_NAME} build_tag=${BUILD_TAG} run= commit_id=${COMMIT_ID} type=cohesive batch_size=1 batch_start=${index} samplesheet= pipeline_timestamp=${PIPELINE_TIMESTAMP}'
+                            }
+                            params {
+                                _meta_node = '${NODE_NAME}'
+                                _meta_build_tag = '${BUILD_TAG}'
+                                _meta_run = ''
+                                _meta_commit_id = '${COMMIT_ID}'
+                                _meta_commit_date = '${COMMIT_DATE}'
+                                _meta_type = 'cohesive'
+                                _meta_batch_size = '1'
+                                _meta_batch_start = '${index}'
+                                _meta_samplesheet = ''
+                                _meta_pipeline_timestamp = '${PIPELINE_TIMESTAMP}'
+                            }
+                        """   
+                        // settings defined in jenkins
+                        writeFile file: 'jenkins.config', text: NXF_CONFIG                                                       
+                        def returnedStatus;
+                        //logstash {
+                            returnedStatus = sh(script: "nextflow -q -log ${META_WORK_FOLDER}/pipeline_info/nxf-${index}.log run -c meta.config -c jenkins.config ${NXF_PARAMS_FILE_OPTION} ${NXF_PROFILES} -work-dir ${PROCESS_OUTPUT_FOLDER}/work/${index} --tracedir ${META_WORK_FOLDER}/pipeline_info --report_dir ${PROCESS_OUTPUT_FOLDER}/pipeline_info --timeline_dir ${PROCESS_OUTPUT_FOLDER}/pipeline_info --outdir ${PROCESS_OUTPUT_FOLDER}/results ${META_WORK_FOLDER}/ngsmanager/${NXF_SCRIPT} ${NGSMANAGER_PARAMS} ${currentParams} -with-weblog ${WEBLOG_ENDPOINT} --report_prefix '${currentPrefix}_' --report_suffix false --monochrome_logs --analysis_date '${analysis_date}' ${NXF_EXTRA}", label: "Processing sample index: ${index} on node ${NODE_NAME}", returnStatus : true)
+                        //}
+                        def log = readFile file: "${META_WORK_FOLDER}/pipeline_info/nxf-${index}.log"
+                        def numOfFailedProcesses = getNumberOfFailedProcesses(log)
+                        if (numOfFailedProcesses > 0) {
+                            totalOfFailedProcesses += numOfFailedProcesses
+                            def msg = "${numOfFailedProcesses} nextflow processes failed (batch: ${index}, id: ${currentPrefix})"
+                            notifyService("danger","${msg}. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', message: 'process failure' ) { error(msg) }
+                        }
+                        if (returnedStatus != 0) {
+                            totalOfFailedBatches++
+                            samplesWithErrors << extractSample(currentParams)
+                            def msg = "Batch: ${index}, id: ${currentPrefix} exited with status ${returnedStatus}"
+                            notifyService("danger","${msg} (entrypoint: ${NXF_ENTRYPOINT}, index: ${index}). ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+                            catchError(buildResult: 'UNSTABLE', stageResult: 'FAILURE', message: 'nextflow workflow failure' ) { error(msg) }                            
+                        }
+                    }
+                } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException fie) {
+                    throw fie
+                } catch (err) {
+                    stackTrace(err)
+                    notifyService("danger","Unexpected error while processing a nextflow batch: ${err} (entrypoint: ${NXF_ENTRYPOINT}, index: ${index}). ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE', message: 'batch processing failure' ) { error("{err}") }
+                } finally {
+                    //work folder cleanup
+                    sh "find ${PROCESS_OUTPUT_FOLDER}/work/${index}/ -type f \\( -name '*.sam' -o -name '*.bcf' -o -name '*.fq' \\) -delete"
+                    if (SCRATCH_FOLDER) {
+                        lock("rsync_${BUILD_TAG}") {
+                            sh """
+                                rm -Rf ${META_WORK_FOLDER}/ngsmanager
+                                rsync -ah --stats --exclude "*@tmp" --remove-source-files ${META_WORK_FOLDER}/* ${META_FOLDER}/
+                                rsync -ah --stats --exclude "*@tmp" --remove-source-files ${PROCESS_OUTPUT_FOLDER}/* ${params.OUTPUT_FOLDER}/                            
+                                # main folder clean-up will be done in a separate job                           
+                            """
+                        }
+                    }                          
+                }
+            // }                          
+            }
+        }
+    }
+
+    stage("Execution") {
+        try {
+            println "${builders}"
+            // add to queue max PARALLEL_PROCESSING_LIMIT job at once
+            (builders.keySet() as List).collate(PARALLEL_PROCESSING_LIMIT).each{
+                def map = builders.subMap(it)
+                echo "Processing indexes: ${it}"
+                parallel map
+            }   
+        } catch (org.jenkinsci.plugins.workflow.steps.FlowInterruptedException fie) {
+            echo "Execution interrupted"
+            currentBuild.result = 'ABORTED'    
+            notifyService("#888888","Execution interrupted. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+        } catch (err) {
+            stackTrace(err)
+            currentBuild.result = 'FAILURE'    
+            notifyService("danger","Unexpected error in stage 'execution' [${NXF_ENTRYPOINT}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+        }
+    }
+
+    stage("Postprocessing") {
+        node(CONTROLLER_NODE) {
+            try {
+                sh """
+                    # errors, warnings
+                    rm -f ${OUTPUT_FOLDER}/warnings.log ${OUTPUT_FOLDER}/errors.log
+                    for f in ${NXF_META_FOLDER}/pipeline_info/nxf-*.log; do
+                        grep -E "\\-\\-cmp" \$f | sed -E 's/.*--cmp ([0-9.A-Za-z]+).*/\\1/g' > tmpsample || true
+                        grep " WARN " \$f  > tmpwarn  || true 
+                        grep " ERROR " \$f > tmperr || true
+                        if [[ -s tmpwarn ]]; 
+                        then
+                            echo "----" >> ${OUTPUT_FOLDER}/warnings.log
+                            cat tmpsample >> ${OUTPUT_FOLDER}/warnings.log
+                            cat tmpwarn >> ${OUTPUT_FOLDER}/warnings.log
+                        fi
+                        if [[ -s tmperr ]]; 
+                        then
+                            echo "----" >> ${OUTPUT_FOLDER}/errors.log
+                            cat tmpsample >> ${OUTPUT_FOLDER}/errors.log
+                            cat tmperr >> ${OUTPUT_FOLDER}/errors.log
+                        fi                        
+                    done        
+
+                    # execution trace        
+                    cat ${NXF_META_FOLDER}/pipeline_info/*_trace.txt | head -n 1 > ${params.OUTPUT_FOLDER}/execution_trace.tsv
+                    for f in ${NXF_META_FOLDER}/pipeline_info/*_trace.txt; do tail -n+2 \${f} ; done >> ${params.OUTPUT_FOLDER}/execution_trace.tsv
+                    
+                    # samples_with_errors, failed_processes
+                    grep "FAILED" ${params.OUTPUT_FOLDER}/execution_trace.tsv | grep IGNORE > failed.tmp || true
+                    if [[ -s failed.tmp ]]; 
+                    then
+                        head -n 1 ${params.OUTPUT_FOLDER}/execution_trace.tsv | cut -d \$'\t' -f 2,4,5,7,8,19 >  ${params.OUTPUT_FOLDER}/failed_processes.tsv
+                        cat failed.tmp | cut -d \$'\t' -f 2,4,5,7,8,19 >>  ${params.OUTPUT_FOLDER}/failed_processes.tsv
+                        cat failed.tmp | cut -d \$'\t' -f 5 | sed 's/\\/.*//g' | sort -u >  ${params.OUTPUT_FOLDER}/samples_with_errors.txt
+                    fi
+                """
+            } catch (err) {
+                echo "Failed: ${err}"
+                def message = "Could not write summary files."
+                notifyService("warning","${message} ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+                currentBuild.result = 'UNSTABLE'
+            }
+            try {
+                def traceFile = "${params.OUTPUT_FOLDER}/execution_trace.tsv"
+                if (fileExists(traceFile)) {
+                    def traces = readCSV file: traceFile, format: CSVFormat.TDF.withFirstRecordAsHeader()
+                    if (traces.count { (it.get('status') ==  'COMPLETED') } == 0) {
+                        currentBuild.result = 'FAILURE'
+                        sh """
+                            echo 'No completed process found in execution trace' >> "${params.OUTPUT_FOLDER}/errors.log"
+                        """ 
+                        notifyService("danger","No completed process found in execution trace. [${NXF_ENTRYPOINT}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+                    }
+                }
+            } catch (err) {
+                stackTrace(err)
+                def message = "Could not check if there is at least a successfully executed process."
+                notifyService("warning","${message} ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+                currentBuild.result = 'UNSTABLE'
+            }
+        }        
+    }
+
+    stage("Publishing") {
+        node(CONTROLLER_NODE) {
+            try {
+                // format trace files
+                dir("${NXF_META_FOLDER}/pipeline_info") {
+                    sh """
+                        for f in *_trace.txt; do column -ts \$'\t' \$f > nxf-\${f%.*}.log; done
+                        cat ${params.OUTPUT_FOLDER}/execution_trace.tsv  | cut -d \$'\t' -f 2,4,5,7,8,19 | column -ts \$'\t'> nxf-all-trace.log
+                        if [[ -s ${params.OUTPUT_FOLDER}/failed_processes.tsv ]]; 
+                        then
+                            column -ts \$'\t' ${params.OUTPUT_FOLDER}/failed_processes.tsv > nxf-failed-trace.log
+                        fi   
+                    """
+                }
+                // publish just logs and trace files
+                publishHTML([allowMissing: true, alwaysLinkToLastBuild: true, keepAll: true, reportDir: "${NXF_META_FOLDER}/pipeline_info", reportFiles: '*.log', reportName: 'Nextflow Logs', reportTitles: '', includes: '*.log'])
+            } catch (err) {
+                echo "Failed: ${err}"
+                def message = "Could not publish pipeline info."
+                notifyService("warning","Could not publish pipeline info. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+                currentBuild.result = 'UNSTABLE'
+            }
+        }
+        notifyServiceAboutBuildStatus(NXF_ENTRYPOINT)
+                }
+} catch (err) {
+    stackTrace(err)
+    currentBuild.result = 'FAILURE'    
+    notifyService("danger","Build finished with result: ${currentBuild.result}. [${NXF_ENTRYPOINT}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+}
+
+def jobParams = []
+jobParams << string(name: 'WATCHED_DIR', value: params.WATCHED_DIR)                        
+jobParams << string(name: 'JENKINS_BUILD_RESULT', value: currentBuild.result ?: 'SUCCESS')
+jobParams << string(name: 'JENKINS_BUILD_URL', value: env.BUILD_URL)
+jobParams << string(name: 'NXF_SCRIPT', value: NXF_SCRIPT)
+jobParams << string(name: 'NXF_ENTRYPOINT', value: NXF_ENTRYPOINT)
+jobParams << string(name: 'NXF_TRACEDIR', value: "${NXF_META_FOLDER}/pipeline_info")
+jobParams << string(name: 'NXF_OUTDIR', value: "${params.OUTPUT_FOLDER}/results")
+jobParams << string(name: 'TEMPLATE_DEFINITION', value: params.TEMPLATE_DEFINITION)                        
+
+build wait: false, job: STATUS_UPDATE_JOB, parameters: jobParams
+
+def extractAnalysisDate(outputFolder) {
+    def matcher = outputFolder =~ /^\d{2}(\d{6})_(\d+)$/      
+    if (!matcher.matches()) {
+        error("invalid timestamp provided: ${outputFolder}")
+    }
+    return "${matcher.group(1)}${matcher.group(2)}".padRight(15,'0')
+}
+
+def getScript() {
+    if (params.STEP) {
+        if (params.STEP.startsWith('9')) {
+            // XXX special case: multi-sample pipelines (e.g. multi_9xx_analysis_method)
+            return "multi/multi_${params.STEP}__${params.METHOD}.nf"
+        } else {
+            return "steps/step_${params.STEP}__${params.METHOD}.nf"
+        }
+    } else if (params.MODULE) {
+        return "modules/module_${params.MODULE}.nf"
+    } else {
+        throw new Exception("Could not calculate entrypoint");
+    }
+}
+
+def createRunParams(samples) {
+    def result = []
+    if (samples) {
+        samples.each {
+            def inputParams =  $/--cmp '${it[0]}' --riscd '${it[1]}' /$
+            for (int i = 2; i < it.size(); i++) {
+                inputParams += " ${it[i]}"
+            }       
+            result << inputParams
+        }
+    }
+    return result
+}
+
+@NonCPS
+def createRunParamsFromJson(samples) {
+    def result = []
+    if (samples) {
+        samples.each {
+            def inputParams = ''
+            it.each { key, value -> 
+                inputParams +=  $/ --${key} '${value}' /$
+            }
+            result << inputParams
+        }                
+    }
+    return result
+}
+
+def notifyServiceAboutBuildStatus(entrypoint) {
+    if (currentBuild.result == 'FAILURE') {
+        notifyService("danger","Build finished with result: ${currentBuild.result}. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    } else if (currentBuild.result == 'UNSTABLE') {
+        notifyService("warning","Build finished with result: ${currentBuild.result}. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    } else if (currentBuild.result in ['NOT_BUILT','ABORTED']) {
+        notifyService("#888888","Build finished with result: ${currentBuild.result}. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    } else  {
+        notifyService("good","Build finished. [${entrypoint}] ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+    }  
+}
+
+def notifyService(color, message) {
+    // [TODO-notifyService]    
+}
+
+def checkParams() {
+    if (!params.MODULE && !params.STEP) {
+        error("one of params: 'MODULE', 'STEP' should be valorized")
+    } 
+    ['TEMPLATE_DEFINITION','WORKER_NODE','CONTROLLER_NODE','WATCHED_DIR','NGSMANAGER_PROJECT'].each {
+        if (!params[it] && !CONFIG[it] && !env."$it") {
+            error("params: '${it}' is required")
+        }
+    }
+}
+
+@NonCPS
+def extractDS(riscd) {
+    def matcher = riscd =~ /^[^-]+-([^-]+)-.*$/        
+    if (!matcher.matches()) {
+        error("invalid riscd provided: ${riscd}")
+    }
+    return "DS${matcher.group(1)}"
+}
+
+@NonCPS
+def getNumOfExecutors(nodeName) {
+    return Jenkins.instance.getNode(nodeName).numExecutors
+}
+
+@NonCPS
+def extractSample(currentParams) {
+    try {
+        if (!currentParams) {
+            // multi sample
+            return "-"
+        }
+        def matcher = currentParams =~ /.*--cmp (\S+)\s.*/
+        if (matcher.matches()) {
+            return matcher.group(1)
+        }
+    } catch (err) {
+        echo "Error: ${err}"        
+    }
+    echo "Warn: could not extract 'cmp' from: '${currentParams}'"
+    return "unknown"
+}
+
+@NonCPS
+def getNumberOfFailedProcesses(log) {
+    // check whether at least one process failed - when 'ignore' error strategy if used, exit code 0 is returned
+    // with failed processed
+    return (log =~ /Process .+ terminated with an error exit status .+ -- Error is ignored/).findAll().size()
+}
+
+@NonCPS
+def stackTrace(err) {
+    try {
+        def sw = new StringWriter()
+        def pw = new PrintWriter(sw)
+        err.printStackTrace(pw)
+        echo sw.toString() 
+    } catch (e) {
+        echo "could not dump stacktrace, exception: ${e}"            
+    }
+}
+
+def getConfiguration() {
+    try {
+        node {
+            configFileProvider(
+                [configFile(fileId: 'jenkins_jobs', variable: "JOB_CONFIG")]) {
+                    return readJSON(file: JOB_CONFIG, returnPojo: true)
+            }
+        }
+    } catch (err) {
+        error("could not load settings")
+    }    
+}

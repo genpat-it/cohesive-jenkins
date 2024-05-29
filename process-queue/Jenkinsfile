@@ -1,0 +1,248 @@
+QUEUED_FOLDER="queued"
+ERROR_FOLDER="failure"
+
+TEMPLATE_NEXTFLOW_JOB="process-nextflow"
+IMPORT_JOB="process-import"
+UPLOAD_JOB="process-upload"
+REFERENCE_JOB="process-reference"
+CUSTOM_SCRIPT_JOB="process-script"
+
+NEXTFLOW_TEMPLATE_NAME='nextflow_execution'
+IMPORT_TEMPLATE_NAME='import'
+UPLOAD_TEMPLATE_NAME='upload'
+REFERENCE_TEMPLATE_NAME='reference'
+CUSTOM_SCRIPT_TEMPLATE_NAME='script'
+
+CONFIG = getConfiguration()
+
+CONTROLLER_NODE = params.CONTROLLER_NODE ?:  CONFIG.CONTROLLER_NODE
+WORKER_NODE = params.WORKER_NODE ?: CONFIG.WORKER_NODE
+
+WATCHED_DIR_INTERVAL = params.WATCHED_DIR_INTERVAL ?: CONFIG.WATCHED_DIR_INTERVAL
+WATCHED_DIR = params.WATCHED_DIR ?: CONFIG.WATCHED_DIR
+RESERVED_NODE_ROLES = params.RESERVED_NODE_ROLES ?:  CONFIG.RESERVED_NODE_ROLES
+
+PRIORITY_ROLES= RESERVED_NODE_ROLES ? RESERVED_NODE_ROLES.split(',') : []
+RESERVED_NODE = params.RESERVED_NODE ?: CONFIG.RESERVED_NODE
+
+CFG = params.JSON_CONFIG ? readJSON(text: params.JSON_CONFIG) : CONFIG.JOBS
+
+
+node(CONTROLLER_NODE) {
+
+    checkParams()
+
+    dir(WATCHED_DIR) {
+        def currentTemplateDefinition;
+        while (true) {
+            sh """
+                { set +x; } 2>/dev/null
+                while [ 1 ]; do ls *.json &> /dev/null && break; sleep ${WATCHED_DIR_INTERVAL};  done
+            """
+            findFiles(glob: '*.json').each {
+                try {
+                    currentTemplateDefinition = it.path
+                    echo "Processing file: ${it.path}"
+                    def pipelineDetails = readJSON file: it.path
+                    echo "Pipeline details: ${pipelineDetails}"
+                    sh """
+                        [ -d "${QUEUED_FOLDER}" ] || mkdir  -p ${QUEUED_FOLDER}                            
+                        mv -f ${it.path} ${QUEUED_FOLDER}/
+                    """
+
+                    def executionNode = getExecutionNode(CFG,pipelineDetails)
+                    
+                    checkDetails(pipelineDetails)
+
+                    if (isNextflowTemplate(pipelineDetails)) {
+                        def jobParams = []
+                        jobParams << string(name: 'OUTPUT_FOLDER', value: pipelineDetails.workingFolder ?: '')
+                        jobParams << string(name: 'STEP', value: pipelineDetails.step ?: '')
+                        jobParams << string(name: 'MODULE', value: pipelineDetails.module ?: '')
+                        jobParams << string(name: 'METHOD', value: pipelineDetails.method ?: '')
+                        jobParams << string(name: 'WATCHED_DIR', value: WATCHED_DIR)
+                        jobParams << string(name: 'TEMPLATE_DEFINITION', value: "${QUEUED_FOLDER}/${it.path}")                        
+                        jobParams << string(name: 'PRIORITY', value: getPriority(pipelineDetails))                         
+                        build wait: false, job: TEMPLATE_NEXTFLOW_JOB, parameters: jobParams
+                    } else if (isImportTemplate(pipelineDetails)) {
+                        def jobParams = []
+                        jobParams << string(name: 'OUTPUT_FOLDER', value: pipelineDetails.workingFolder ?: '')
+                        jobParams << string(name: 'WATCHED_DIR', value: WATCHED_DIR)                        
+                        jobParams << string(name: 'TEMPLATE_DEFINITION', value: "${QUEUED_FOLDER}/${it.path}")                        
+                        build wait: false, job: IMPORT_JOB, parameters: jobParams   
+                    } else if (isUploadTemplate(pipelineDetails)) {
+                        def jobParams = []
+                        jobParams << string(name: 'OUTPUT_FOLDER', value: pipelineDetails.workingFolder ?: '')
+                        jobParams << string(name: 'WATCHED_DIR', value: WATCHED_DIR)                        
+                        jobParams << string(name: 'TEMPLATE_DEFINITION', value: "${QUEUED_FOLDER}/${it.path}")   
+                        build wait: false, job: UPLOAD_JOB, parameters: jobParams   
+                   } else if (isReferenceTemplate(pipelineDetails)) {
+                        def jobParams = []
+                        jobParams << string(name: 'OUTPUT_FOLDER', value: pipelineDetails.workingFolder ?: '')
+                        jobParams << string(name: 'WATCHED_DIR', value: WATCHED_DIR)                        
+                        jobParams << string(name: 'TEMPLATE_DEFINITION', value: "${QUEUED_FOLDER}/${it.path}")                        
+                        build wait: false, job: REFERENCE_JOB, parameters: jobParams                      
+                    } else if (isCustomScriptTemplate(pipelineDetails)) {
+                        def jobParams = []
+                        jobParams << string(name: 'OUTPUT_FOLDER', value: pipelineDetails.workingFolder ?: '')
+                        jobParams << string(name: 'WATCHED_DIR', value: WATCHED_DIR)
+                        jobParams << string(name: 'TEMPLATE_DEFINITION', value: "${QUEUED_FOLDER}/${it.path}")                             
+                        build wait: false, job: CUSTOM_SCRIPT_JOB, parameters: jobParams   
+                    } else {
+                        error("unknown template: ${pipelineDetails}")                           
+                    }
+                } catch (err) {
+                    echo "ERROR: ${err}"
+                    notifyService("danger","ERROR: could not process '${currentTemplateDefinition}'. ${env.JOB_NAME} ${env.BUILD_NUMBER} (<${env.BUILD_URL}|Open>)")
+                    if (currentTemplateDefinition) {
+                        sh """
+                            mkdir  -p ${ERROR_FOLDER}
+                            mv -f ${currentTemplateDefinition} ${ERROR_FOLDER}/ || mv -f ${QUEUED_FOLDER}/${currentTemplateDefinition} ${ERROR_FOLDER}/
+                        """        
+                    } else {
+                        sleep time: "${WATCHED_DIR_INTERVAL}"
+                    }                
+                }  
+            }
+        }       
+    }
+ }
+
+def isNextflowTemplate(pipelineDetails) {
+    return pipelineDetails.template == NEXTFLOW_TEMPLATE_NAME
+}
+
+def isUploadTemplate(pipelineDetails) {
+    return pipelineDetails.template == UPLOAD_TEMPLATE_NAME;
+}
+
+def isReferenceTemplate(pipelineDetails) {
+    return pipelineDetails.template == REFERENCE_TEMPLATE_NAME;
+}
+
+def isImportTemplate(pipelineDetails) {
+    return pipelineDetails.template == IMPORT_TEMPLATE_NAME;
+}
+
+def isCustomScriptTemplate(pipelineDetails) {
+    return pipelineDetails.template == CUSTOM_SCRIPT_TEMPLATE_NAME;
+}
+
+def isUsingScratchFolder(cfg, pipelineDetails) {
+    try {
+        def nextflowTemplate = isNextflowTemplate(pipelineDetails)
+
+        def cfgKey = nextflowTemplate ? getEntrypoint(pipelineDetails) : pipelineDetails.template
+        if (cfg[cfgKey] && cfg[cfgKey].containsKey('use_scratch_folder')) {
+            return cfg[cfgKey].use_scratch_folder            
+        } 
+        if (cfg['use_scratch_folder']) {
+            return true
+        }
+        //default
+        return false
+    } catch (err) {
+        echo "ERROR: ${err}"
+        error("Could not process CFG to calculate an execution node label")
+    }
+}
+
+def getExecutionNode(cfg, pipelineDetails) {
+    try {
+        def nextflowTemplate = isNextflowTemplate(pipelineDetails)
+        def customScriptTemplate = isCustomScriptTemplate(pipelineDetails)
+
+        def result = WORKER_NODE      
+
+        def cfgKey = (nextflowTemplate || customScriptTemplate) ? getEntrypoint(pipelineDetails) : pipelineDetails.template
+        if (cfg[cfgKey]) {
+            echo "CFG for template: ${cfg[cfgKey]}"
+            if (cfg[cfgKey].node) {
+                //forcing a specific label
+                result = cfg[cfgKey].node
+            }
+        } else if (hasDedicatedNodes(cfgKey)) {
+            result = cfgKey
+        } 
+
+        if (pipelineDetails.node) {
+            // forse usage of proposed label as well - if valid
+            def proposed = "(${result}) && ${pipelineDetails.node}"
+            if (hasDedicatedNodes(proposed)) {
+                result = proposed
+            }            
+        }
+
+        // only PRIORITY_ROLES can use a RESERVED_NODE
+        if (RESERVED_NODE && !(pipelineDetails.role in PRIORITY_ROLES)) {
+            result = "(${result}) && !${RESERVED_NODE}"
+        } 
+        echo "Execution Node: ${result}"
+        return result
+    } catch (err) {
+        echo "ERROR: ${err}"
+        error("Could not process CFG to calculate an execution node label")
+    }
+}
+
+def checkParams() {
+    ['WATCHED_DIR','WATCHED_DIR_INTERVAL','CONTROLLER_NODE','WORKER_NODE'].each {
+        if (!params[it] && !CONFIG[it] && !env."$it") {
+            error("params: '${it}' is required")
+        }
+    }
+}
+
+def checkDetails(details) {
+    ['template','workingFolder','role'].each {
+        if (!details[it]) {
+            error("template definition field: '${it}' is required")
+        }
+    }
+}
+
+@NonCPS
+def hasDedicatedNodes(label) {
+    try {
+        return !nodesByLabel(label: label).isEmpty()
+    } catch (err) {
+        echo "Failed: ${err}. Could not check whether label: ${label} is used by any node."
+        return false;
+    }
+}
+
+def getEntrypoint(details) {
+    if (details.step && details.method) {
+        return "step_${details.step}__${details.method}"
+    } else if (details.module) {
+        return "module_${details.module}"
+    } else {
+        throw new Exception("Could not calculate entrypoint");
+    }
+}
+
+def getPriority(details) {
+    try {
+        def calculatedPriority = (details.user as int) % 1000 + 1
+        return "${calculatedPriority}"
+     } catch (err) {
+        echo "ERROR: could not calculate priority: ${err}"
+        return "";
+    }
+}
+def notifyService(color, message) {
+    // [TODO-notifyService]
+}
+
+def getConfiguration() {
+    try {
+        node {
+            configFileProvider(
+                [configFile(fileId: 'jenkins_jobs', variable: "JOB_CONFIG")]) {
+                    return readJSON(file: JOB_CONFIG, returnPojo: true)
+            }
+        }
+    } catch (err) {
+        error("could not load settings")
+    }    
+}
