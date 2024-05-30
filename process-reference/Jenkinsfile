@@ -43,7 +43,7 @@ try {
             stage("Download from NCBI") {
                 dir (META_FOLDER) {                    
                     echo "Cloning nextflow project"
-                    checkout poll: false, scm: [$class: 'GitSCM', branches: [[name: "${COMMIT_ID}"]], extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'ngsmanager']], userRemoteConfigs: [[credentialsId: 'git_repo',url: "${NGSMANAGER_PROJECT}"]]]                        
+                    checkout poll: false, scm: [$class: 'GitSCM', branches: [[name: "${COMMIT_ID}"]], extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'ngsmanager']], userRemoteConfigs: [[url: "${NGSMANAGER_PROJECT}"]]]                        
                 }     
                 ws (params.OUTPUT_FOLDER) {      
                     def paramsFileExists = fileExists PARAMS_FILE

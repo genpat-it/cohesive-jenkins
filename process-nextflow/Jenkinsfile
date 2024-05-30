@@ -159,7 +159,7 @@ try {
                             if (!previouslyCloned) {
                             dir ("${META_FOLDER}") {                    
                                 echo "Cloning nextflow project"
-                                scmVars = checkout poll: false, scm: [$class: 'GitSCM', branches: [[name: "${COMMIT_ID}"]], extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'ngsmanager']], userRemoteConfigs: [[credentialsId: 'git_repo',url: "${NGSMANAGER_PROJECT}"]]]                        
+                                scmVars = checkout poll: false, scm: [$class: 'GitSCM', branches: [[name: "${COMMIT_ID}"]], extensions: [[$class: 'RelativeTargetDirectory', relativeTargetDir: 'ngsmanager']], userRemoteConfigs: [[url: "${NGSMANAGER_PROJECT}"]]]                        
                                 COMMIT_ID = scmVars.GIT_COMMIT
                                 COMMIT_DATE = sh(script: "git -C ngsmanager log --pretty=tformat:'%cI' -1", returnStdout: true).trim();
                             }
