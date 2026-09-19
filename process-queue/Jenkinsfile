@@ -63,6 +63,12 @@ node(CONTROLLER_NODE) {
                         jobParams << string(name: 'WATCHED_DIR', value: WATCHED_DIR)
                         jobParams << string(name: 'TEMPLATE_DEFINITION', value: "${QUEUED_FOLDER}/${it.path}")                        
                         jobParams << string(name: 'PRIORITY', value: getPriority(pipelineDetails))                         
+                        // Pin the framework revision per execution when the queued job
+                        // asks for one: process-nextflow already honours the parameter,
+                        // it was simply never forwarded. Empty means "use CONFIG".
+                        if (pipelineDetails.ngsmanagerRef) {
+                            jobParams << string(name: 'NGSMANAGER_REF', value: pipelineDetails.ngsmanagerRef)
+                        }
                         build wait: false, job: TEMPLATE_NEXTFLOW_JOB, parameters: jobParams
                     } else if (isImportTemplate(pipelineDetails)) {
                         def jobParams = []
